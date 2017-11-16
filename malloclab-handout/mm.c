@@ -51,8 +51,9 @@
 void *firstPage = NULL; //points to first allocated page, right at start of pageHeaderBlock at front of page
 void *current_avail = NULL; //this is free list pointer
 void *freeListPtr = NULL;
-int current_avail_size = 0; //total amount of free memory
-int biggestFreeSize = 0; //current biggest free block of memory
+void *endFreeListPtr = NULL;
+size_t current_avail_size = 0; //total amount of free memory
+size_t biggestFreeSize = 0; //current biggest free block of memory
 int numPagesToAllocate = 1;
 
 typedef struct 
@@ -82,6 +83,9 @@ typedef struct
 static void *coalesce(void *bp);
 static void set_allocated(void *bp, size_t size);
 static void extend(size_t new_size);
+static size_t findBiggestFreeBlock();
+static void *init_malloc(void *bp, size_t size);
+static void add_to_free_list(void *bp);
 
 /* 
  * mm_init - initialize the malloc package.
@@ -93,6 +97,7 @@ int mm_init(void)
 	firstPage = NULL;
 	current_avail = NULL; //this is free list pointer
 	freeListPtr = NULL;
+	endFreeListPtr = NULL;
 	current_avail_size = 0;
 	biggestFreeSize = 0;
 	numPagesToAllocate = 1;
@@ -109,21 +114,24 @@ int mm_init(void)
 	GET_PREV_PAGE_PTR(firstPage) = NULL; //this is incorrect currently, put into struct. MACROS and functions? it might be right now?
 	
 	freeListPtr = firstPage + 2*ALIGNMENT; //Points to first payload block that is free
-	GET_NEXT_FREE_PTR(freeListPtr) = NULL;
-	GET_PREV_FREE_PTR(freeListPtr) = NULL;
 
 	current_avail = firstPage + 2*ALIGNMENT; //skip over first 16 bytes for room of the pointers for page locations and header bytes to get to the start of the first payload
 	current_avail_size = amount - 2*ALIGNMENT; //can't include bytes needed for blank first buffer space, null terminator, or pointers to new pages
 	biggestFreeSize = current_avail_size;
 	//set free space header and footer blocks
-	GET_SIZE(HDRP(current_avail)) = current_avail_size;
-	GET_ALLOC(HDRP(current_avail)) = 0;
-	GET_SIZE(FTRP(current_avail)) = current_avail_size;
+	GET_SIZE(HDRP(freeListPtr)) = current_avail_size;
+	GET_ALLOC(HDRP(freeListPtr)) = 0;
+	GET_SIZE(FTRP(freeListPtr)) = current_avail_size;
 	//set terminator
-	GET_SIZE(HDRP(NEXT_BLKP(current_avail))) = 0;
-	GET_ALLOC(HDRP(NEXT_BLKP(current_avail))) = 1;
+	GET_SIZE(HDRP(NEXT_BLKP(freeListPtr))) = 0;
+	GET_ALLOC(HDRP(NEXT_BLKP(freeListPtr))) = 1;
+
 	//malloc the prologue block
-	mm_malloc(0);
+	freeListPtr = init_malloc(freeListPtr, 0);
+	endFreeListPtr = freeListPtr;
+	GET_NEXT_FREE_PTR(freeListPtr) = NULL;
+	GET_PREV_FREE_PTR(freeListPtr) = NULL;
+	biggestFreeSize = biggestFreeSize - 32;
 	
   	return 0;
 }
@@ -134,12 +142,16 @@ int mm_init(void)
  */
 void *mm_malloc(size_t size)
 {
-	int newsize = ALIGN(size + OVERHEAD);
-	printf("Just made newsize %d\n", newsize);
-	if (current_avail_size < newsize || biggestFreeSize < newsize) //change this to extend which will need to give us more memory 
+	if(size == 0) //if they try to malloc nothing
 	{
-		printf("Current availale size %d was less than new size %d\n", current_avail_size, newsize);
-		extend(newsize);
+		return NULL;
+	}
+	int newSize = ALIGN(size + OVERHEAD);
+	//printf("Just made newsize %d\n", newSize);
+	if (current_avail_size < newSize || biggestFreeSize < newSize) //change this to extend which will need to give us more memory 
+	{
+		//printf("Current availale size %d was less than new size %d\n", biggestFreeSize, newSize);
+		extend(newSize);
 		
 		if (current_avail == NULL)
 		{
@@ -148,34 +160,44 @@ void *mm_malloc(size_t size)
 	}
 
 	void *p = freeListPtr;
-	printf("Set p to current avail %p\n", p);
-	printf("Size of first block is: %d\n", GET_SIZE(HDRP(p)));
+	//printf("Set p to current avail %p\n", p);
+	//printf("Size of first block is: %d\n", GET_SIZE(HDRP(p)));
 
 	//this is first fit find of unallocated block with implicit free list rather than explicit
 	while (GET_SIZE(HDRP(p)) < newSize && GET_NEXT_FREE_PTR(p) != NULL) 
 	{
 		p = GET_NEXT_FREE_PTR(p);
-/*
-		printf("Current payload pointer looking at has alloc of: %d\n", GET_ALLOC(HDRP(p)));
-		if (!GET_ALLOC(HDRP(p)) && (GET_SIZE(HDRP(p)) >= newsize)) 
-		{
-			printf("Found something to allocate\n");
-			set_allocated(p, newsize);
-			current_avail += newsize;
-			current_avail_size -= newsize;
-			biggestFreeSize = findBiggestBlockAvailable();
-			return p;
-		}
-		p = NEXT_BLKP(p);
-*/
 	}
 	
 	set_allocated(p, newSize);
-	
-	//p = current_avail;
-	//printf("Found nothing.\n");
-
+	current_avail_size -= newSize;
+	biggestFreeSize = findBiggestFreeBlock();
 	return p;
+}
+
+
+/* 
+ * init_malloc - Allocate a block for the prologue and never
+ * 	release the memory.
+ */
+static void *init_malloc(void *bp, size_t size)
+{
+	//printf("RUNNING init_malloc.\n");
+	int newSize = ALIGN(size + OVERHEAD);
+	//printf("Just made newsize %d\n", newSize);
+
+	//printf("Set p to current avail %p\n", bp);
+	//printf("Size of first block is: %d\n", GET_SIZE(HDRP(bp)));
+	
+	size_t extra_size = GET_SIZE(HDRP(bp)) - newSize;
+	GET_SIZE(HDRP(bp)) = newSize;
+	GET_SIZE(FTRP(bp)) = newSize;
+	GET_SIZE(HDRP(NEXT_BLKP(bp))) = extra_size;
+	GET_SIZE(FTRP(NEXT_BLKP(bp))) = extra_size;
+	GET_ALLOC(HDRP(NEXT_BLKP(bp))) = 0;
+	GET_ALLOC(HDRP(bp)) = 1;
+	current_avail_size -= newSize;
+	return NEXT_BLKP(bp);
 }
 
 /*
@@ -186,7 +208,12 @@ void mm_free(void *ptr)
 	printf("Calling free on %p\n", ptr);
 	if(mm_can_free(ptr)) //also maybe check mm_check returning 1
 	{
-
+		GET_ALLOC(HDRP(ptr)) = 0;
+		GET_NEXT_FREE_PTR(ptr) = freeListPtr;
+		GET_PREV_FREE_PTR(freeListPtr) = ptr;
+		freeListPtr = ptr;
+		GET_PREV_FREE_PTR(freeListPtr) = NULL;
+ 		coalesce(ptr);
 	}
 }
 
@@ -213,17 +240,18 @@ static void *coalesce(void *bp)
 	size_t prev_alloc = GET_ALLOC(HDRP(PREV_BLKP(bp)));
 	size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(bp)));
 	size_t size = GET_SIZE(HDRP(bp));
-	if (prev_alloc && next_alloc) 
+	if (prev_alloc && next_alloc) //both allocated
 	{ /* Case 1 */
 		/* nothing to do */
+		add_to_free_list(bp);
 	}
-	else if (prev_alloc && !next_alloc) 
+	else if (prev_alloc && !next_alloc) //one after is not allocated
 	{ /* Case 2 */
 		size += GET_SIZE(HDRP(NEXT_BLKP(bp)));
 		GET_SIZE(HDRP(bp)) = size;
 		GET_SIZE(FTRP(bp)) = size;
 	}
-	else if (!prev_alloc && next_alloc) 
+	else if (!prev_alloc && next_alloc) //
 	{ /* Case 3 */
 		size += GET_SIZE(HDRP(PREV_BLKP(bp)));
 		GET_SIZE(FTRP(bp)) = size;
@@ -239,6 +267,12 @@ static void *coalesce(void *bp)
 		bp = PREV_BLKP(bp);
 	}
 	return bp;
+}
+
+
+static void add_to_free_list(void *bp)
+{
+
 }
 
 /*
@@ -273,12 +307,24 @@ static void extend(size_t new_size)
 	GET_SIZE(HDRP(NEXT_BLKP(bp))) = 0;
 	GET_ALLOC(HDRP(NEXT_BLKP(bp))) = 1;
 
-
 	current_avail_size += chunk_size;
-	biggestFreeSize = chunk_size;	
-	current_avail = bp; // this not right
+	biggestFreeSize = chunk_size - 32;	
 
-	mm_malloc(0);
+	bp = init_malloc(bp, 0);
+	if(freeListPtr == NULL)
+	{
+		freeListPtr = bp;
+		endFreeListPtr = bp;
+		GET_NEXT_FREE_PTR(bp) = NULL;
+		GET_PREV_FREE_PTR(bp) = NULL;
+	}
+	else
+	{
+		GET_NEXT_FREE_PTR(endFreeListPtr) = bp;
+		GET_PREV_FREE_PTR(bp) = endFreeListPtr;
+		GET_NEXT_FREE_PTR(bp) = NULL;
+		endFreeListPtr = bp;
+	}
 }
 
 /*
@@ -296,20 +342,71 @@ static void set_allocated(void *bp, size_t size)
 		GET_SIZE(HDRP(NEXT_BLKP(bp))) = extra_size;
 		GET_SIZE(FTRP(NEXT_BLKP(bp))) = extra_size;
 		GET_ALLOC(HDRP(NEXT_BLKP(bp))) = 0;
-
-		GET_NEXT_FREE_PTR(NEXT_BLKP(bp)) = GET_NEXT_FREE_PTR(bp);
-		GET_PREV_FREE_PTR(GET_NEXT_FREE_PTR(bp)) = NEXT_BLKP(bp);
-		GET_PREV_FREE_PTR(NEXT_BLKP(bp)) = GET_PREV_FREE_PTR(bp);
-		GET_NEXT_FREE_PTR(GET_PREV_FREE_PTR(bp)) = NEXT_BLKP(bp);	
 		
+		if(GET_NEXT_FREE_PTR(bp) != NULL)
+		{
+			GET_NEXT_FREE_PTR(NEXT_BLKP(bp)) = GET_NEXT_FREE_PTR(bp);
+			GET_PREV_FREE_PTR(GET_NEXT_FREE_PTR(bp)) = NEXT_BLKP(bp);
+		}
+		else //this means last item in free list
+		{
+			GET_NEXT_FREE_PTR(NEXT_BLKP(bp)) = NULL;
+			endFreeListPtr = NEXT_BLKP(bp);
+		}
+		if(GET_PREV_FREE_PTR(bp) != NULL)
+		{
+			GET_PREV_FREE_PTR(NEXT_BLKP(bp)) = GET_PREV_FREE_PTR(bp);
+			GET_NEXT_FREE_PTR(GET_PREV_FREE_PTR(bp)) = NEXT_BLKP(bp);	
+		}
+		else //this means first item in free list
+		{
+			GET_PREV_FREE_PTR(NEXT_BLKP(bp)) = NULL;
+			freeListPtr = NEXT_BLKP(bp);
+		}
 	}
 	else //free block not split
 	{
-		GET_NEXT_FREE_PTR(GET_PREV_FREE_PTR(bp)) = GET_NEXT_FREE_PTR(bp);
-		GET_PREV_FREE_PTR(GET_NEXT_FREE_PTR(bp)) = GET_PREV_FREE_PTR(bp);
+		if(GET_NEXT_FREE_PTR(bp) != NULL && GET_PREV_FREE_PTR(bp) != NULL)
+		{
+			GET_NEXT_FREE_PTR(GET_PREV_FREE_PTR(bp)) = GET_NEXT_FREE_PTR(bp);
+			GET_PREV_FREE_PTR(GET_NEXT_FREE_PTR(bp)) = GET_PREV_FREE_PTR(bp);
+		}
+		else if(GET_NEXT_FREE_PTR(bp) != NULL) //front of the list
+		{
+			GET_PREV_FREE_PTR(GET_NEXT_FREE_PTR(bp)) = NULL;
+			freeListPtr = GET_NEXT_FREE_PTR(bp);
+
+		}
+		else if(GET_PREV_FREE_PTR(bp) != NULL) //end of the list
+		{
+			GET_NEXT_FREE_PTR(GET_PREV_FREE_PTR(bp)) = NULL;
+			endFreeListPtr = GET_PREV_FREE_PTR(bp);
+		}
+		else //cutting out last free block
+		{
+			freeListPtr = NULL;
+			endFreeListPtr = NULL;
+		}
 	}
 	GET_NEXT_FREE_PTR(bp) = NULL;
 	GET_PREV_FREE_PTR(bp) = NULL;
 	GET_ALLOC(HDRP(bp)) = 1;
+}
 
+/*
+* Find biggest unallocated block size.
+*/
+static size_t findBiggestFreeBlock()
+{
+	size_t tempBiggest = 0;
+	void *p = freeListPtr;
+	while(GET_NEXT_FREE_PTR(p) != NULL)
+	{
+		if(GET_SIZE(HDRP(p)) > tempBiggest)
+		{
+			tempBiggest = GET_SIZE(HDRP(p));
+		}
+		p = GET_NEXT_FREE_PTR(p);
+	}
+	return tempBiggest;
 }
