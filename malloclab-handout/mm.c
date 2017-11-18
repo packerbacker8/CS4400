@@ -86,6 +86,9 @@ static void extend(size_t new_size);
 static size_t findBiggestFreeBlock();
 static void *init_malloc(void *bp, size_t size);
 static void add_to_free_list(void *bp);
+static int checkIsMangled(void *p);
+static void removeFromFreeList(void *bp);
+static void addToFrontOfFreeList(void *ptr);
 
 /* 
  * mm_init - initialize the malloc package.
@@ -153,7 +156,7 @@ void *mm_malloc(size_t size)
 		//printf("Current availale size %d was less than new size %d\n", biggestFreeSize, newSize);
 		extend(newSize);
 		
-		if (current_avail == NULL)
+		if (endFreeListPtr == NULL)
 		{
 			return NULL;
 		}
@@ -178,17 +181,12 @@ void *mm_malloc(size_t size)
 
 /* 
  * init_malloc - Allocate a block for the prologue and never
- * 	release the memory.
+ * 	release the memory. Meant for allocator's use only.
  */
 static void *init_malloc(void *bp, size_t size)
 {
-	//printf("RUNNING init_malloc.\n");
 	int newSize = ALIGN(size + OVERHEAD);
-	//printf("Just made newsize %d\n", newSize);
 
-	//printf("Set p to current avail %p\n", bp);
-	//printf("Size of first block is: %d\n", GET_SIZE(HDRP(bp)));
-	
 	size_t extra_size = GET_SIZE(HDRP(bp)) - newSize;
 	GET_SIZE(HDRP(bp)) = newSize;
 	GET_SIZE(FTRP(bp)) = newSize;
@@ -205,15 +203,12 @@ static void *init_malloc(void *bp, size_t size)
  */
 void mm_free(void *ptr)
 {
-	printf("Calling free on %p\n", ptr);
+	//printf("Calling free on %p\n", ptr);
 	if(mm_can_free(ptr)) //also maybe check mm_check returning 1
 	{
 		GET_ALLOC(HDRP(ptr)) = 0;
-		GET_NEXT_FREE_PTR(ptr) = freeListPtr;
-		GET_PREV_FREE_PTR(freeListPtr) = ptr;
-		freeListPtr = ptr;
-		GET_PREV_FREE_PTR(freeListPtr) = NULL;
- 		coalesce(ptr);
+ 		ptr = coalesce(ptr);
+		addToFrontOfFreeList(ptr);
 	}
 }
 
@@ -232,39 +227,59 @@ int mm_check()
  */
 int mm_can_free(void *p)
 {
-  return 1;
+  return GET_ALLOC(HDRP(p));
 }
 
-static void *coalesce(void *bp) 
+/*
+ * coalesce - If two or more unallocated blocks are next to each
+ *            other, then combine those unallocated blocks into
+ *            one block.  Readjust free list pointers.
+ */ 
+static void *coalesce(void *bp) //check video at malloc 18 at 3:30
 {
 	size_t prev_alloc = GET_ALLOC(HDRP(PREV_BLKP(bp)));
 	size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(bp)));
 	size_t size = GET_SIZE(HDRP(bp));
 	if (prev_alloc && next_alloc) //both allocated
 	{ /* Case 1 */
+		//printf("Case 1 Coalescing\n");
 		/* nothing to do */
-		add_to_free_list(bp);
+		//add_to_free_list(bp);
 	}
 	else if (prev_alloc && !next_alloc) //one after is not allocated
 	{ /* Case 2 */
+		//printf("Case 2 Coalescing\n");
+		removeFromFreeList(NEXT_BLKP(bp));
+
 		size += GET_SIZE(HDRP(NEXT_BLKP(bp)));
 		GET_SIZE(HDRP(bp)) = size;
 		GET_SIZE(FTRP(bp)) = size;
 	}
-	else if (!prev_alloc && next_alloc) //
+	else if (!prev_alloc && next_alloc) //one before is not allocated
 	{ /* Case 3 */
+		//printf("Case 3 Coalescing\n");
+		removeFromFreeList(PREV_BLKP(bp));
+
 		size += GET_SIZE(HDRP(PREV_BLKP(bp)));
 		GET_SIZE(FTRP(bp)) = size;
 		GET_SIZE(HDRP(PREV_BLKP(bp))) = size;
 		bp = PREV_BLKP(bp);
 	}
-	else 
+	else //both neighbor blocks are not allocated
 	{ /* Case 4 */
-		size += (GET_SIZE(HDRP(PREV_BLKP(bp)))
-		+ GET_SIZE(HDRP(NEXT_BLKP(bp))));
+		//printf("Case 4 Coalescing\n");
+		removeFromFreeList(NEXT_BLKP(bp));
+		removeFromFreeList(PREV_BLKP(bp));
+
+		size += (GET_SIZE(HDRP(PREV_BLKP(bp))) + GET_SIZE(HDRP(NEXT_BLKP(bp))));
 		GET_SIZE(HDRP(PREV_BLKP(bp))) = size;
 		GET_SIZE(FTRP(NEXT_BLKP(bp))) = size;
 		bp = PREV_BLKP(bp);
+	}
+	current_avail_size += size;
+	if(size > biggestFreeSize)
+	{
+		biggestFreeSize = size;
 	}
 	return bp;
 }
@@ -286,6 +301,7 @@ static void extend(size_t new_size)
 	void* bp = mem_map(chunk_size);
 	if(bp == NULL)
 	{
+		endFreeListPtr = NULL;
 		return;
 	}
 	numPagesToAllocate *= 2;
@@ -311,7 +327,7 @@ static void extend(size_t new_size)
 	biggestFreeSize = chunk_size - 32;	
 
 	bp = init_malloc(bp, 0);
-	if(freeListPtr == NULL)
+	if(freeListPtr == NULL && endFreeListPtr == NULL)
 	{
 		freeListPtr = bp;
 		endFreeListPtr = bp;
@@ -320,6 +336,7 @@ static void extend(size_t new_size)
 	}
 	else
 	{
+		//set to end of the free list
 		GET_NEXT_FREE_PTR(endFreeListPtr) = bp;
 		GET_PREV_FREE_PTR(bp) = endFreeListPtr;
 		GET_NEXT_FREE_PTR(bp) = NULL;
@@ -334,6 +351,7 @@ static void extend(size_t new_size)
 static void set_allocated(void *bp, size_t size) 
 {
 	size_t extra_size = GET_SIZE(HDRP(bp)) - size;
+	removeFromFreeList(bp);
 	//when free block is split
 	if (extra_size > ALIGN(1 + OVERHEAD)) 
 	{
@@ -343,50 +361,7 @@ static void set_allocated(void *bp, size_t size)
 		GET_SIZE(FTRP(NEXT_BLKP(bp))) = extra_size;
 		GET_ALLOC(HDRP(NEXT_BLKP(bp))) = 0;
 		
-		if(GET_NEXT_FREE_PTR(bp) != NULL)
-		{
-			GET_NEXT_FREE_PTR(NEXT_BLKP(bp)) = GET_NEXT_FREE_PTR(bp);
-			GET_PREV_FREE_PTR(GET_NEXT_FREE_PTR(bp)) = NEXT_BLKP(bp);
-		}
-		else //this means last item in free list
-		{
-			GET_NEXT_FREE_PTR(NEXT_BLKP(bp)) = NULL;
-			endFreeListPtr = NEXT_BLKP(bp);
-		}
-		if(GET_PREV_FREE_PTR(bp) != NULL)
-		{
-			GET_PREV_FREE_PTR(NEXT_BLKP(bp)) = GET_PREV_FREE_PTR(bp);
-			GET_NEXT_FREE_PTR(GET_PREV_FREE_PTR(bp)) = NEXT_BLKP(bp);	
-		}
-		else //this means first item in free list
-		{
-			GET_PREV_FREE_PTR(NEXT_BLKP(bp)) = NULL;
-			freeListPtr = NEXT_BLKP(bp);
-		}
-	}
-	else //free block not split
-	{
-		if(GET_NEXT_FREE_PTR(bp) != NULL && GET_PREV_FREE_PTR(bp) != NULL)
-		{
-			GET_NEXT_FREE_PTR(GET_PREV_FREE_PTR(bp)) = GET_NEXT_FREE_PTR(bp);
-			GET_PREV_FREE_PTR(GET_NEXT_FREE_PTR(bp)) = GET_PREV_FREE_PTR(bp);
-		}
-		else if(GET_NEXT_FREE_PTR(bp) != NULL) //front of the list
-		{
-			GET_PREV_FREE_PTR(GET_NEXT_FREE_PTR(bp)) = NULL;
-			freeListPtr = GET_NEXT_FREE_PTR(bp);
-
-		}
-		else if(GET_PREV_FREE_PTR(bp) != NULL) //end of the list
-		{
-			GET_NEXT_FREE_PTR(GET_PREV_FREE_PTR(bp)) = NULL;
-			endFreeListPtr = GET_PREV_FREE_PTR(bp);
-		}
-		else //cutting out last free block
-		{
-			freeListPtr = NULL;
-			endFreeListPtr = NULL;
-		}
+		addToFrontOfFreeList(NEXT_BLKP(bp));
 	}
 	GET_NEXT_FREE_PTR(bp) = NULL;
 	GET_PREV_FREE_PTR(bp) = NULL;
@@ -400,6 +375,10 @@ static size_t findBiggestFreeBlock()
 {
 	size_t tempBiggest = 0;
 	void *p = freeListPtr;
+	if(p == NULL)
+	{
+		return tempBiggest;
+	}
 	while(GET_NEXT_FREE_PTR(p) != NULL)
 	{
 		if(GET_SIZE(HDRP(p)) > tempBiggest)
@@ -410,3 +389,58 @@ static size_t findBiggestFreeBlock()
 	}
 	return tempBiggest;
 }
+
+static int checkIsMangled(void *p)
+{
+	void* changedP = ADDRESS_PAGE_START(p);
+    return !mem_is_mapped(changedP, PAGE_ALIGN((p + sizeof(pageHeaderBlock)) - changedP));
+}
+
+
+static void removeFromFreeList(void *bp)
+{
+	if(GET_NEXT_FREE_PTR(bp) != NULL && GET_PREV_FREE_PTR(bp) != NULL) //normal, middle of list
+	{
+		GET_PREV_FREE_PTR(GET_NEXT_FREE_PTR(bp)) = GET_PREV_FREE_PTR(bp);
+		GET_NEXT_FREE_PTR(GET_PREV_FREE_PTR(bp)) = GET_NEXT_FREE_PTR(bp);
+		GET_NEXT_FREE_PTR(bp) = NULL;
+		GET_PREV_FREE_PTR(bp) = NULL;
+	}
+	else if(GET_PREV_FREE_PTR(bp) != NULL) //end of list
+	{
+		GET_NEXT_FREE_PTR(GET_PREV_FREE_PTR(bp)) = NULL;
+		endFreeListPtr = GET_PREV_FREE_PTR(bp);
+		GET_PREV_FREE_PTR(bp) = NULL;
+	}
+	else if(GET_NEXT_FREE_PTR(bp) != NULL) //beginning of list
+	{
+		GET_PREV_FREE_PTR(GET_NEXT_FREE_PTR(bp)) = NULL;
+		freeListPtr = GET_NEXT_FREE_PTR(bp);
+		GET_NEXT_FREE_PTR(bp) = NULL;
+
+	}
+	else //both beginning and end, alpha and omega
+	{
+		freeListPtr = NULL;
+		endFreeListPtr = NULL;
+	}
+}
+
+static void addToFrontOfFreeList(void *ptr)
+{
+	if(freeListPtr == NULL && endFreeListPtr == NULL)
+	{
+		freeListPtr = ptr;
+		endFreeListPtr = ptr;
+		GET_NEXT_FREE_PTR(ptr) = NULL;
+		GET_PREV_FREE_PTR(ptr) = NULL;
+	}
+	else
+	{
+		GET_NEXT_FREE_PTR(ptr) = freeListPtr;
+		GET_PREV_FREE_PTR(freeListPtr) = ptr;
+		freeListPtr = ptr;
+		GET_PREV_FREE_PTR(freeListPtr) = NULL;
+	}
+}
+
